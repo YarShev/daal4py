@@ -27,7 +27,7 @@ import ray
 import modin.pandas as pd
 
 
-@ray.remote(num_cpus=1)
+@ray.remote()
 class KMeansRowPartitionsActor(RowPartitionsActor):
     def __init__(self, node):
         super().__init__(node)
@@ -73,6 +73,86 @@ def distributed_k_means_fit(X, n_clusters, max_iter):
     i = 0
     for actor in actors:
         actor.set_row_parts._remote(
+            args=(
+            row_partitions[
+                slice(i, i + row_parts_last_idx)
+                if i + row_parts_last_idx < len(row_partitions)
+                else slice(i, len(row_partitions))
+            ])
+        )
+        i += row_parts_last_idx
+
+    context = RayContext()
+    pyccl = PyOneCCL(context.get_world_size(), context.current_node_id())
+
+    # KMeans random initialization
+    centroids = X.sample(n=n_clusters).to_numpy()
+
+    result = np.array([]).reshape(3, 0)
+
+    for actor in actors:
+        tmp = actor._kmeans_dal_compute_with_init_centers._remote(
+            args=(centroids, n_clusters, max_iter, pyccl),
+            num_returns=3,
+        )
+        result = np.concatenate((result, np.array([tmp]).T), axis=1)
+
+    # retrieving data via object refs
+    centroids, inertia, assignments = (
+        ray.get(list(result[0]))[0],
+        ray.get(list(result[1]))[0],
+        pd.DataFrame(ray.get(list(result[2]))[0]),
+    )
+
+    return centroids, assignments, inertia, max_iter
+
+class KMeansDaskRowPartitionsActor(RowPartitionsActor):
+    def __init__(self, node):
+        super().__init__(node)
+
+    def _kmeans_dal_compute_with_init_centers(
+        self, centroids, n_clusters, n_iters, pyccl
+    ):
+        pyccl.set_env()
+
+        data_np = np.ascontiguousarray(self.get_row_parts().to_numpy())
+        kmeans = daal4py.kmeans(n_clusters, n_iters, distributed=True)
+        result = kmeans.compute(data_np, centroids)
+
+        kmeans = daal4py.kmeans(n_clusters, 0, assignFlag=True)
+        assignments = kmeans.compute(data_np, result.centroids).assignments
+
+        result = (result.centroids, result.objectiveFunction, assignments) if daal4py.my_procid()==0 else (np.asarray([]), 0, assignments)
+
+        return result
+
+
+def distributed_k_means_fit(X, n_clusters, max_iter):
+    from distributed.client import get_client
+    actors = []
+    dask_client = get_client()
+    ips = list([*dask_client.scheduler_info()["workers"].keys()])
+    first_ip = ips[0][6:].split(':')[0]
+    actors.append(dask_client.submit(KMeansDaskRowPartitionsActor, workers=set([first_ip]), actor=True).result())
+    for ip in ips[1:]:
+        next_ip = ip[6:].split(':')[0]
+        if next_ip != first_ip:
+            actors.append(dask_client.submit(KMeansDaskRowPartitionsActor, workers=set([next_ip]), actor=True).result())
+
+    # Getting actual objects from futures
+    actors = [actor.result() for actor in actors]
+
+    row_partitions = unwrap_row_partitions(X)
+
+    row_parts_last_idx = (
+        len(row_partitions) // len(actors)
+        if len(row_partitions) % len(actors) == 0
+        else len(row_partitions) // len(actors) + 1
+    )
+
+    i = 0
+    for actor in actors:
+        actor.set_row_parts(
             args=(
             row_partitions[
                 slice(i, i + row_parts_last_idx)
